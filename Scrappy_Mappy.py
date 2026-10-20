@@ -1,14 +1,7 @@
 """
-tiktok_scraper.py
+Scrappy_Mappy.py
 -----------------
-Scraper académico de métricas públicas de TikTok.
-
-- Playwright se usa para el perfil y la lista de videos (funciona bien).
-- yt-dlp se usa para extraer métricas de cada video (evita el 403).
-
-Requisitos:
-    pip install beautifulsoup4 playwright playwright-stealth yt-dlp
-    python -m playwright install chromium
+ 
 """
 
 import argparse
