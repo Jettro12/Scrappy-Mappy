@@ -1,13 +1,31 @@
 """
 Scrappy_Mappy.py
 -----------------
- 
+Scraper académico de métricas públicas de TikTok.
+
+Extrae:
+  - Perfil: seguidores, seguidos, likes totales, videos, biografía, verificado, región
+  - Videos: likes, comentarios, shares, vistas, descripción, hashtags,
+            fecha de subida, duración, música
+  - Opcional (--with-comments): texto de los primeros N comentarios por video
+
+Requisitos:
+    pip install beautifulsoup4 playwright playwright-stealth yt-dlp curl_cffi
+    python -m playwright install chromium
+
+Uso:
+    python Scrappy_Mappy.py usuario --no-headless
+    python Scrappy_Mappy.py usuario
+    python Scrappy_Mappy.py usuario --with-comments
+    python Scrappy_Mappy.py --batch
+    python Scrappy_Mappy.py usuario --reset-session
 """
 
 import argparse
 import csv
 import json
 import random
+import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -110,6 +128,9 @@ def _extract_profile_from_json(html):
                 return {
                     "username":    user.get("uniqueId"),
                     "nickname":    user.get("nickname"),
+                    "bio":         user.get("signature"),
+                    "verified":    user.get("verified"),
+                    "region":      user.get("region"),
                     "followers":   stats.get("followerCount"),
                     "following":   stats.get("followingCount"),
                     "likes_total": stats.get("heart") or stats.get("heartCount"),
@@ -130,6 +151,9 @@ def _extract_profile_from_json(html):
                 return {
                     "username":    user.get("uniqueId"),
                     "nickname":    user.get("nickname"),
+                    "bio":         user.get("signature"),
+                    "verified":    user.get("verified"),
+                    "region":      user.get("region"),
                     "followers":   stats.get("followerCount"),
                     "following":   stats.get("followingCount"),
                     "likes_total": stats.get("heartCount") or stats.get("heart"),
@@ -141,6 +165,7 @@ def _extract_profile_from_json(html):
 
 def _extract_profile_from_selectors(page):
     return {
+        "bio":         _first_text(page, ["h2[data-e2e='user-bio']"]),
         "followers":   _first_text(page, ["strong[data-e2e='followers-count']"]),
         "following":   _first_text(page, ["strong[data-e2e='following-count']"]),
         "likes_total": _first_text(page, ["strong[data-e2e='likes-count']"]),
@@ -231,14 +256,37 @@ def _save_session(context, label=""):
 # 3) EXTRACCIÓN DE MÉTRICAS DE VIDEO CON YT-DLP
 # ============================================================
 
+def _extract_hashtags(data):
+    """Hashtags del video, desde varias fuentes de yt-dlp."""
+    tags = data.get("hashtags")
+    if tags:
+        return list(tags)
+    challenges = data.get("challenges")
+    if challenges:
+        return [c.get("title", "") for c in challenges
+                if isinstance(c, dict) and c.get("title")]
+    desc = data.get("description") or ""
+    return re.findall(r"#(\w+)", desc)
+
+def _extract_music(data):
+    """Música del video, en formato 'titulo - autor' si es posible."""
+    music = data.get("music_info")
+    if isinstance(music, dict):
+        title = music.get("title")
+        author = music.get("author")
+        if title and author:
+            return f"{title} - {author}"
+        return title or author
+    return data.get("track")
+
 def get_video_metrics_ytdlp(video_url):
     """
-    Usa yt-dlp para obtener like_count, comment_count, repost_count
-    de un video de TikTok. Devuelve un dict o None si falla.
+    Usa yt-dlp para obtener métricas y metadatos del video.
+    Devuelve un dict o None si falla.
     """
     cmd = [
         "yt-dlp",
-        "--impersonate=chrome-131",   # impersonación de Chrome para evitar 403
+        "--impersonate=chrome-131",
         "--dump-json",
         "--skip-download",
         "--no-warnings",
@@ -258,10 +306,15 @@ def get_video_metrics_ytdlp(video_url):
             return None
         data = json.loads(proc.stdout)
         return {
-            "likes":    data.get("like_count"),
-            "comments": data.get("comment_count"),
-            "shares":   data.get("repost_count"),
-            "views":    data.get("view_count"),
+            "likes":       data.get("like_count"),
+            "comments":    data.get("comment_count"),
+            "shares":      data.get("repost_count"),
+            "views":       data.get("view_count"),
+            "description": data.get("description"),
+            "hashtags":    _extract_hashtags(data),
+            "upload_date": data.get("upload_date"),
+            "duration":    data.get("duration"),
+            "music":       _extract_music(data),
         }
     except subprocess.TimeoutExpired:
         print(f"    [yt-dlp] Timeout para {video_url}")
@@ -271,10 +324,141 @@ def get_video_metrics_ytdlp(video_url):
         return None
 
 # ============================================================
-# 4) SCRAPER PRINCIPAL
+# 4) COMENTARIOS VÍA MODAL DE PLAYWRIGHT (opcional)
 # ============================================================
 
-def scrape_tiktok(username, headless=True, max_videos=10, reset_session=False):
+def get_video_comments_playwright(page, video_id, max_comments=10):
+    """
+    Desde la página del perfil, abre el video en modal y extrae comentarios.
+    Usa un truco de JS para evitar la navegación por defecto del enlace.
+    """
+    try:
+        # 1. Encontrar la tarjeta y hacer scroll
+        link = page.locator(f'a[href*="/video/{video_id}"]').first
+        link.scroll_into_view_if_needed(timeout=5000)
+        page.wait_for_timeout(1000)
+
+        # 2. TRUCO: Quitar el href temporalmente y hacer clic vía JS
+        # Esto evita que el navegador navegue a la URL del video.
+        link.evaluate("""
+            el => {
+                el.setAttribute('data-old-href', el.getAttribute('href'));
+                el.removeAttribute('href');
+                el.click();
+            }
+        """)
+        page.wait_for_timeout(3500) # Esperar a que el modal cargue
+
+        # 3. Restaurar el href por si acaso (aunque el modal esté abierto)
+        try:
+            page.evaluate("""
+                () => {
+                    document.querySelectorAll('a[data-old-href]').forEach(el => {
+                        el.setAttribute('href', el.getAttribute('data-old-href'));
+                        el.removeAttribute('data-old-href');
+                    });
+                }
+            """)
+        except Exception:
+            pass
+
+        # 4. Verificar si abrió el modal o si navegó
+        if f"/video/{video_id}" in page.url:
+            print(f"    [comments] Aún navegó a la página. Regresando...")
+            page.go_back()
+            page.wait_for_timeout(2000)
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(1000)
+            return []
+
+        # 5. Esperar a que carguen los comentarios en el modal
+        selectors = [
+            '[data-e2e="comment-level-1"]',
+            'div[class*="DivCommentItemContainer"]',
+            'p[data-e2e="comment-level-1"]'
+        ]
+        
+        loaded = False
+        for sel in selectors:
+            try:
+                page.wait_for_selector(sel, timeout=7000)
+                loaded = True
+                break
+            except PWTimeout:
+                continue
+
+        if not loaded:
+            print(f"    [comments] Modal abierto, pero sin comentarios para {video_id}")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(1500)
+            return []
+
+        # 6. Extraer comentarios
+        comments = []
+        seen = set()
+        
+        for _ in range(5):
+            elements = page.locator('[data-e2e="comment-level-1"]').all()
+            if not elements:
+                elements = page.locator('div[class*="DivCommentItemContainer"]').all()
+                
+            for el in elements:
+                try:
+                    text_el = el.locator("p").first
+                    if text_el.count() > 0:
+                        text = text_el.inner_text(timeout=2000).strip()
+                    else:
+                        text = el.inner_text(timeout=2000).strip()
+                        
+                    if not text or text in seen:
+                        continue
+                    
+                    likes = None
+                    try:
+                        likes_el = el.locator('[data-e2e="comment-like-count"]').first
+                        if likes_el.count() > 0:
+                            likes = likes_el.inner_text().strip()
+                    except Exception:
+                        pass
+                        
+                    comments.append({"text": text, "likes": likes})
+                    seen.add(text)
+                except Exception:
+                    continue
+            
+            if len(comments) >= max_comments:
+                break
+                
+            # 7. Hacer scroll dentro del panel de comentarios
+            try:
+                page.locator('[data-e2e="comment-list"]').first.evaluate(
+                    "el => el.scrollTop = el.scrollHeight"
+                )
+            except Exception:
+                page.mouse.wheel(0, 800)
+            page.wait_for_timeout(1500)
+
+        # 8. Cerrar el modal
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(2500)  # Pausa clave para que el modal desaparezca del DOM
+        
+        return comments[:max_comments]
+        
+    except Exception as e:
+        print(f"    [comments] Error inesperado en {video_id}: {e}")
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+        return []
+# ============================================================
+# 5) SCRAPER PRINCIPAL
+# ============================================================
+
+def scrape_tiktok(username, headless=True, max_videos=20,
+                  reset_session=False, with_comments=False,
+                  max_comments=10):
     url = f"https://www.tiktok.com/@{username}"
     result = {
         "scraped_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -354,13 +538,21 @@ def scrape_tiktok(username, headless=True, max_videos=10, reset_session=False):
                 if k in profile:
                     profile[k] = parse_abbreviated_number(profile[k])
             result["profile"] = profile
+            bio_preview = (profile.get("bio") or "")[:60]
             print(f"[perfil] @{profile.get('username') or username} "
                   f"→ {profile.get('followers')} seguidores")
+            if bio_preview:
+                print(f"[perfil] bio: {bio_preview}...")
 
             _save_session(context, label="tras cargar perfil")
 
-            # ---------- LISTA DE VIDEOS ----------
+                   # ---------- LISTA DE VIDEOS ----------
             _dismiss_login_modal(page)
+            
+            # Pequeño scroll para forzar la carga de la cuadrícula
+            page.wait_for_timeout(2000)
+            page.mouse.wheel(0, 600)
+            page.wait_for_timeout(2000)
 
             try:
                 page.wait_for_selector('[data-e2e="user-post-item"]', timeout=20_000)
@@ -368,28 +560,38 @@ def scrape_tiktok(username, headless=True, max_videos=10, reset_session=False):
                 msg = "No se encontraron tarjetas de video (posible login wall o bloqueo)"
                 print(f"[videos] {msg}")
                 result["errors"].append(msg)
+                try:
+                    page.screenshot(path="debug_videos_fallo.png")
+                    print("[debug] Captura guardada en debug_videos_fallo.png.")
+                except Exception:
+                    pass
+                if not headless:
+                    print("\nPresiona ENTER en esta ventana para cerrar el navegador...")
+                    input()
                 return result
 
-            video_urls = []
-            for _ in range(10):
+            video_ids = []
+            for _ in range(20):
                 for link in page.locator('[data-e2e="user-post-item"] a[href*="/video/"]').all():
                     try:
-                        href = link.get_attribute("href")
+                        href = link.get_attribute("href") or ""
                     except Exception:
                         continue
-                    if href:
-                        if href.startswith("/"):
-                            href = "https://www.tiktok.com" + href
-                        if href not in video_urls:
-                            video_urls.append(href)
-                if len(video_urls) >= max_videos:
+                    m = re.search(r"/video/(\d+)", href)
+                    if m:
+                        vid = m.group(1)
+                        if vid not in video_ids:
+                            video_ids.append(vid)
+                if len(video_ids) >= max_videos:
                     break
                 page.mouse.wheel(0, 2000)
                 page.wait_for_timeout(random.randint(1500, 3000))
 
-            video_urls = video_urls[:max_videos]
+            video_ids = video_ids[:max_videos]
+            video_urls = [f"https://www.tiktok.com/@{username}/video/{vid}" for vid in video_ids]
             print(f"[videos] Encontrados {len(video_urls)} videos. Extrayendo métricas con yt-dlp...")
 
+            
             # ---------- MÉTRICAS CON YT-DLP ----------
             for i, vurl in enumerate(video_urls, start=1):
                 entry = {"url": vurl, "likes": None, "comments": None, "shares": None}
@@ -404,8 +606,22 @@ def scrape_tiktok(username, headless=True, max_videos=10, reset_session=False):
                     print(f"  [{i}/{len(video_urls)}] FALLO  {vurl}")
 
                 result["videos"].append(entry)
-                # Pausa entre peticiones para no saturar
                 time.sleep(random.uniform(1.5, 3.0))
+
+            # ---------- COMENTARIOS VÍA MODAL (opcional) ----------
+                       # ---------- COMENTARIOS (opcional) ----------
+            if with_comments and video_urls:
+                print(f"\n[comments] Extrayendo primeros {max_comments} comentarios por video...")
+                for i, vurl in enumerate(video_urls, start=1):
+                    comments = get_video_comments_playwright(
+                        page, vurl, max_comments=max_comments
+                    )
+                    for entry in result["videos"]:
+                        if entry["url"] == vurl:
+                            entry["top_comments"] = comments
+                            break
+                    print(f"  [comments {i}/{len(video_urls)}] {len(comments)} comentarios")
+                    time.sleep(random.uniform(2.0, 4.0))
 
             return result
 
@@ -416,7 +632,7 @@ def scrape_tiktok(username, headless=True, max_videos=10, reset_session=False):
                 pass
 
 # ============================================================
-# 5) EXPORTACIÓN
+# 6) EXPORTACIÓN
 # ============================================================
 
 def save_json(result, path):
@@ -427,32 +643,47 @@ def save_csv(result, path):
     profile = result.get("profile") or {}
     rows = []
     for v in result.get("videos", []):
+        hashtags = v.get("hashtags") or []
+        hashtags_str = ",".join(hashtags) if isinstance(hashtags, list) else str(hashtags)
         rows.append({
-            "scraped_at":     result.get("scraped_at"),
-            "username":       profile.get("username"),
-            "nickname":       profile.get("nickname"),
-            "followers":      profile.get("followers"),
-            "following":      profile.get("following"),
-            "likes_total":    profile.get("likes_total"),
-            "video_count":    profile.get("video_count"),
-            "video_url":      v.get("url"),
-            "video_likes":    v.get("likes"),
-            "video_comments": v.get("comments"),
-            "video_shares":   v.get("shares"),
-            "video_views":    v.get("views"),
-            "error":          v.get("error", ""),
+            "scraped_at":        result.get("scraped_at"),
+            "username":          profile.get("username"),
+            "nickname":          profile.get("nickname"),
+            "bio":               profile.get("bio"),
+            "verified":          profile.get("verified"),
+            "region":            profile.get("region"),
+            "followers":         profile.get("followers"),
+            "following":         profile.get("following"),
+            "likes_total":       profile.get("likes_total"),
+            "video_count":       profile.get("video_count"),
+            "video_url":         v.get("url"),
+            "video_likes":       v.get("likes"),
+            "video_comments":    v.get("comments"),
+            "video_shares":      v.get("shares"),
+            "video_views":       v.get("views"),
+            "video_description": v.get("description"),
+            "video_hashtags":    hashtags_str,
+            "video_upload_date": v.get("upload_date"),
+            "video_duration_s":  v.get("duration"),
+            "video_music":       v.get("music"),
+            "error":             v.get("error", ""),
         })
     if not rows:
         rows.append({
             "scraped_at": result.get("scraped_at"),
             "username":   profile.get("username"),
             "nickname":   profile.get("nickname"),
+            "bio":        profile.get("bio"),
+            "verified":   profile.get("verified"),
+            "region":     profile.get("region"),
             "followers":  profile.get("followers"),
             "following":  profile.get("following"),
             "likes_total": profile.get("likes_total"),
             "video_count": profile.get("video_count"),
             "video_url": "", "video_likes": "", "video_comments": "",
-            "video_shares": "", "video_views": "", "error": "",
+            "video_shares": "", "video_views": "", "video_description": "",
+            "video_hashtags": "", "video_upload_date": "",
+            "video_duration_s": "", "video_music": "", "error": "",
         })
     fieldnames = list(rows[0].keys())
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -461,16 +692,46 @@ def save_csv(result, path):
         writer.writerows(rows)
     print(f"[export] CSV  → {path}")
 
+def save_comments_csv(result, path):
+    """Una fila por comentario (solo si se usó --with-comments)."""
+    rows = []
+    for v in result.get("videos", []):
+        for c in v.get("top_comments", []) or []:
+            rows.append({
+                "video_url":     v.get("url"),
+                "comment_text":  c.get("text"),
+                "comment_likes": c.get("likes"),
+            })
+    if not rows:
+        print("[export] Sin comentarios que exportar (usa --with-comments).")
+        return
+    fieldnames = ["video_url", "comment_text", "comment_likes"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[export] CSV comentarios → {path} ({len(rows)} filas)")
+
 # ============================================================
-# 6) CLI
+# 7) CLI
 # ============================================================
 
-def _run_one(username, headless, max_videos, output, reset_session):
-    base = output or f"tiktok_{username}_{int(time.time())}"
-    print(f"\n=== Scrapeando @{username} (headless={headless}) ===")
-    result = scrape_tiktok(username, headless=headless, max_videos=max_videos, reset_session=reset_session)
+def _run_one(username, headless, max_videos, output, reset_session,
+             with_comments, max_comments):
+    base = output or f"scrappy_mapy_{username}_{int(time.time())}"
+    print(f"\n=== Scrapeando @{username} (headless={headless}, with_comments={with_comments}) ===")
+    result = scrape_tiktok(
+        username,
+        headless=headless,
+        max_videos=max_videos,
+        reset_session=reset_session,
+        with_comments=with_comments,
+        max_comments=max_comments,
+    )
     save_json(result, f"{base}.json")
     save_csv(result, f"{base}.csv")
+    save_comments_csv(result, f"{base}_comments.csv")
+
     if result["errors"]:
         print(f"⚠️  {len(result['errors'])} errores registrados:")
         for e in result["errors"]:
@@ -486,6 +747,10 @@ def main():
     ap.add_argument("--no-headless", action="store_true", help="Muestra el navegador (1ª vez para captcha)")
     ap.add_argument("--output", default=None, help="Nombre base de los archivos de salida")
     ap.add_argument("--max-videos", type=int, default=10)
+    ap.add_argument("--with-comments", action="store_true",
+                    help="Extrae también el texto de los comentarios (más lento)")
+    ap.add_argument("--max-comments", type=int, default=10,
+                    help="Comentarios por video (solo con --with-comments)")
     ap.add_argument("--batch", action="store_true", help="Pide varios usuarios seguidos")
     ap.add_argument("--reset-session", action="store_true", help="Borra session.json")
     args = ap.parse_args()
@@ -494,7 +759,8 @@ def main():
     reset = args.reset_session
 
     if args.username:
-        _run_one(args.username, headless, args.max_videos, args.output, reset)
+        _run_one(args.username, headless, args.max_videos, args.output, reset,
+                 args.with_comments, args.max_comments)
         return
 
     if not args.batch:
@@ -506,7 +772,8 @@ def main():
         if not username:
             print("No escribiste ningún usuario. Saliendo.")
             return
-        _run_one(username, headless, args.max_videos, args.output, reset)
+        _run_one(username, headless, args.max_videos, args.output, reset,
+                 args.with_comments, args.max_comments)
         return
 
     print("Modo batch. Escribe un usuario y Enter. Escribe 'salir' para terminar.")
@@ -520,7 +787,9 @@ def main():
         if username.lower() in ("salir", "exit", "quit", ""):
             print("Fin del batch.")
             break
-        _run_one(username, headless, args.max_videos, args.output, reset if first else False)
+        _run_one(username, headless, args.max_videos, args.output,
+                 reset if first else False,
+                 args.with_comments, args.max_comments)
         first = False
         wait = random.randint(15, 30)
         print(f"⏳ Esperando {wait}s antes del siguiente usuario...")
