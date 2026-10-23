@@ -29,7 +29,7 @@ COLORES_SENT = {
     "negativo": "#F44336",
     "neutral":  "#9E9E9E",
     "mixto":    "#FFC107",
-}
+}   # <-- FIX: eliminada la "ñ" suelta que rompía el archivo
 TRADUCCION_EMOCIONES = {
     "joy":      "Alegría",
     "sadness":  "Tristeza",
@@ -51,25 +51,28 @@ def encontrar_json_reciente(prefijo="scrappy_mapy_*.json"):
 def analizar_texto(texto, tipo):
     if not texto or not texto.strip():
         return None
+
     prompt = f"""Analiza el siguiente texto extraído de los {tipo} de un video de TikTok.
 
 --- TEXTO ---
 {texto}
 
 --- INSTRUCCIONES ---
-Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta:
+Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura:
 {{
   "sentimiento": "positivo" | "negativo" | "neutral" | "mixto",
   "emocion": "joy" | "sadness" | "anger" | "fear" | "surprise" | "disgust" | "neutral",
   "big_five": {{
-    "apertura": <float 0.0-1.0>,
-    "responsabilidad": <float 0.0-1.0>,
-    "extraversion": <float 0.0-1.0>,
-    "amabilidad": <float 0.0-1.0>,
-    "neuroticismo": <float 0.0-1.0>
+    "apertura": 0.0,
+    "responsabilidad": 0.0,
+    "extraversion": 0.0,
+    "amabilidad": 0.0,
+    "neuroticismo": 0.0
   }}
 }}
-No incluyas explicaciones, solo el JSON y al final de todo agrega una recomendación a la cuenta basado en los datos."""
+Cada valor de big_five debe ser un float entre 0.0 y 1.0.
+Devuelve únicamente el JSON válido."""
+
     try:
         completion = client.chat.completions.create(
             model=MODELO,
@@ -77,7 +80,34 @@ No incluyas explicaciones, solo el JSON y al final de todo agrega una recomendac
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-        return json.loads(completion.choices[0].message.content)
+
+        resultado = json.loads(completion.choices[0].message.content)
+
+        big_five = resultado.get("big_five", {})
+
+        individuales = {
+            rasgo: round(max(0.0, min(1.0, float(big_five.get(rasgo, 0.0)))) * 100, 2)
+            for rasgo in RASGOS
+        }
+
+        total = sum(individuales.values())
+
+        if total > 0:
+            normalizados = {
+                rasgo: round(valor / total * 100, 2)
+                for rasgo, valor in individuales.items()
+            }
+            diferencia = round(100 - sum(normalizados.values()), 2)
+            mayor = max(normalizados, key=normalizados.get)
+            normalizados[mayor] += diferencia
+        else:
+            normalizados = {rasgo: 0.0 for rasgo in RASGOS}
+
+        resultado["big_five_individual"] = individuales
+        resultado["big_five_normalizado"] = normalizados
+
+        return resultado
+
     except Exception as e:
         print(f"  [error] {tipo}: {e}")
         return None
@@ -87,7 +117,6 @@ def graficar_todo(resultados, username):
     desc = [r["descripcion"] for r in resultados if r.get("descripcion")]
     com  = [r["comentarios"] for r in resultados if r.get("comentarios")]
 
-    # Usamos constrained_layout para evitar que los textos se encimen
     fig = plt.figure(figsize=(18, 16), constrained_layout=True)
     fig.suptitle(f"Análisis de @{username} — {len(resultados)} videos",
                  fontsize=16, fontweight="bold")
@@ -157,7 +186,6 @@ def _graficar_radar(ax, desc, com):
     ax.set_thetagrids(np.degrees(angulos[:-1]), [r.capitalize() for r in RASGOS])
     ax.set_ylim(0, 1)
     ax.set_title("Big Five promedio — Creador vs Audiencia", pad=20)
-    # Leyenda abajo para no tapar el título
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=2, fontsize=10)
 
 
@@ -177,7 +205,7 @@ def _graficar_emociones(ax, desc, com):
     ax.bar(x - width/2, conteo(desc), width, label="Descripciones", color="#1E88E5")
     ax.bar(x + width/2, conteo(com),  width, label="Comentarios",   color="#E53935")
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right") # Rotación mejorada
+    ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_ylabel("Nº de videos")
     ax.set_title("Distribución de emociones", pad=15)
     ax.legend()
@@ -219,15 +247,14 @@ def main():
 
     username = data.get("profile", {}).get("username", "perfil")
     videos = data.get("videos", [])[:args.max_videos]
-    
-    # NUEVA ALERTA: Avisar si no hay comentarios en el JSON
+
     tiene_comentarios = any(v.get("top_comments") for v in videos)
     if not tiene_comentarios:
         print("\n⚠️  ADVERTENCIA: Este JSON no contiene comentarios.")
         print("   Los gráficos de la audiencia se mostrarán vacíos.")
         print("   Para solucionarlo, genera un nuevo JSON con:")
-        print("   python Scrappy_Mappy.py nasa --no-headless --with-comments\n")
-    
+        print("   python Scrappy_Mappy.py nasa --with-comments\n")
+
     print(f"[info] @{username} — {len(videos)} videos a analizar\n")
 
     resultados = []
